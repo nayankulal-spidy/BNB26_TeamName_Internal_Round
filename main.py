@@ -152,7 +152,7 @@ def analyze_with_gemini(payload: AnalyzeRequest) -> AnalyzeResponse:
     prompt = build_analysis_prompt(payload)
 
     model = genai.GenerativeModel(
-        "gemini-2.0-flash",
+        "gemini-3.8-flash",
         generation_config={"response_mime_type": "application/json"},
     )
 
