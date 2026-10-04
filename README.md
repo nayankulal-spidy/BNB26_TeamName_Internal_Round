@@ -19,8 +19,16 @@ A learner may:
 - Understand the concept but make a specific reasoning error
 - Misunderstand a programming rule
 - Have an incorrect assumption about a physical principle
-- Make a mistake that reveals a deeper misconception
+- Make a mistake that reveals a deeper misconception                                                                                                             
+## 🚀 Live Demo
 
+👉 [**Open Re:Learn Website**](https://relearnnn.lovable.app)
+
+## 📂 Project Structure
+
+- `frontend/` — Frontend application
+- `app/` — Backend
+- `main.py` — Backend entry point
 ### Re:Learn takes a different approach.
 
 Instead of simply marking a response as incorrect, Re:Learn analyzes the learner's:
