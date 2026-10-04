@@ -1,250 +1,147 @@
-import json
+# main.py — Re:Learn Complete Backend
+# ------------------------------------------------------------
+# This file wires together every router, sets up CORS,
+# creates the DB schema, seeds initial data, and exposes
+# health & demo endpoints.
+# ------------------------------------------------------------
+
 import os
-import re
-from typing import Any, Optional
-
-import google.generativeai as genai
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from supabase import Client, create_client
+from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
 
+# ------------------------------------------------------------
+# Load environment variables (GROQ_API_KEY, GROQ_MODEL, etc.)
+# ------------------------------------------------------------
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SESSIONS_TABLE = "sessions"
+# ------------------------------------------------------------
+# App configuration & metadata
+# ------------------------------------------------------------
+app = FastAPI(
+    title="Re:Learn API",
+    description=(
+        "Identify *WHY* a learner is wrong, provide a targeted intervention, "
+        "and verify the misconception is actually resolved."
+    ),
+    version="1.0.0",
+)
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
-supabase: Optional[Client] = None
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-app = FastAPI(title="Re:Learn Misconception Detection API")
-
+# ------------------------------------------------------------
+# CORS – allow the frontend (Vercel) to call the API
+# ------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],          # change to specific domains for production
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ------------------------------------------------------------
+# Database & seed
+# ------------------------------------------------------------
+from app.config import settings               # your Settings pydantic class
+from app.database import Base, SessionLocal, engine
+from app import models                        # noqa: F401 – registers tables
+from app.seed import seed_if_empty
 
-class AnalyzeRequest(BaseModel):
-    question: str
-    student_answer: str
-    correct_answer: str
-    domain: str = "programming"
+# Create all tables if they don’t exist yet
+Base.metadata.create_all(bind=engine)
 
+# Populate minimal seed data (questions, misconceptions, etc.) on first run
+with SessionLocal() as db:
+    seed_if_empty(db)
 
-class AnalyzeResponse(BaseModel):
-    misconception_type: str
-    confidence: float = Field(ge=0, le=1)
-    explanation: str
-    intervention: str
-    is_correct: bool
+# ------------------------------------------------------------
+# Import and include all routers
+# ------------------------------------------------------------
+from app.routers import (
+    attempts,
+    auth,
+    concepts,
+    diagnosis,
+    evaluation,
+    interventions,
+    legacy,
+    misconceptions,
+    questions,
+    reassessments,
+    students,
+)
 
+app.include_router(auth.router)
+app.include_router(concepts.router)
+app.include_router(questions.router)
+app.include_router(attempts.router)
+app.include_router(diagnosis.router)
+app.include_router(misconceptions.router)
+app.include_router(interventions.router)
+app.include_router(reassessments.router)   # <-- NEW endpoint
+app.include_router(students.router)
+app.include_router(evaluation.router)
+app.include_router(legacy.router)
 
-class SaveSessionRequest(BaseModel):
-    question: str
-    student_answer: str
-    correct_answer: str
-    domain: str = "programming"
-    misconception_type: str
-    confidence: float
-    explanation: str
-    intervention: str
-    is_correct: bool
-    resolved: bool = False
-
-
-ANALYSIS_PROMPT = """You are an expert learning-science tutor for {domain}.
-
-Your job is NOT to grade right vs wrong as the main output. Diagnose the student's
-underlying misconception: the specific faulty mental model that produced this answer.
-
-Identify a concrete misconception TYPE using a short title, such as:
-- Operator Precedence Confusion
-- Variable Scope Misunderstanding
-- Off-by-one Error Pattern
-- Pass-by-Reference vs Pass-by-Value Mixup
-- Boolean Short-Circuit Misread
-Only use "No Misconception Detected" when the student answer is conceptually aligned
-with the correct answer (minor wording differences are still correct).
-
-Question:
-{question}
-
-Student answer:
-{student_answer}
-
-Correct answer:
-{correct_answer}
-
-Return ONLY valid JSON with these keys:
-- misconception_type: string (specific type name, not "wrong" or "incorrect")
-- confidence: number from 0 to 1
-- explanation: 2-3 sentences describing the thinking error, not just the correct fact
-- intervention: a concrete tip or exercise that repairs that mental model
-- is_correct: boolean
-
-Do not wrap the JSON in markdown. Do not add extra keys."""
-
-
-def get_supabase() -> Client:
-    if supabase is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY.",
-        )
-    return supabase
-
-
-def parse_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in {"true", "1", "yes"}
-    return False
-
-
-def build_analysis_prompt(payload: AnalyzeRequest) -> str:
-    # Avoid str.format so student code containing { or } cannot crash the prompt.
-    return (
-        ANALYSIS_PROMPT.replace("{domain}", payload.domain)
-        .replace("{question}", payload.question)
-        .replace("{student_answer}", payload.student_answer)
-        .replace("{correct_answer}", payload.correct_answer)
+# ------------------------------------------------------------
+# Global exception handlers
+# ------------------------------------------------------------
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(_: Request, exc: RequestValidationError):
+    """Return a concise 422 payload for any validation error."""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "Invalid request. Check required fields."},
     )
 
-
-def extract_json(text: str) -> dict[str, Any]:
-    cleaned = text.strip()
-    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned)
-    if fenced:
-        cleaned = fenced.group(1).strip()
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini returned non-JSON output: {exc}",
-        ) from exc
-    if not isinstance(parsed, dict):
-        raise HTTPException(status_code=502, detail="Gemini JSON was not an object.")
-    return parsed
-
-
-def analyze_with_gemini(payload: AnalyzeRequest) -> AnalyzeResponse:
-    if not GEMINI_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="GEMINI_API_KEY is not set.",
-        )
-
-    prompt = build_analysis_prompt(payload)
-
-    model = genai.GenerativeModel(
-        "gemini-3.8-flash",
-        generation_config={"response_mime_type": "application/json"},
+@app.exception_handler(Exception)
+async def generic_exception_handler(_: Request, exc: Exception):
+    """Catch‑all handler – surface HTTPException correctly, otherwise 500."""
+    if isinstance(exc, HTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Something went wrong. Please try again."},
     )
 
-    try:
-        result = model.generate_content(prompt)
-        raw_text = (getattr(result, "text", None) or "").strip()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini analysis failed: {exc}",
-        ) from exc
+# ------------------------------------------------------------
+# Health check endpoint
+# ------------------------------------------------------------
+@app.get("/", tags=["Health"])
+def health_check():
+    return {
+        "status": "ok",
+        "service": "relearn-backend",
+        "provider": "groq",
+        "model": settings.groq_model,          # e.g. "llama-3.1-8b-instant"
+        "idea": "Re:Learn diagnoses WHY a learner is wrong, then checks if the misconception is resolved.",
+    }
 
-    if not raw_text:
-        raise HTTPException(
-            status_code=502,
-            detail="Gemini returned an empty response.",
-        )
-
-    data = extract_json(raw_text)
-
-    try:
-        confidence = float(data.get("confidence", 0))
-        confidence = max(0.0, min(1.0, confidence))
-        return AnalyzeResponse(
-            misconception_type=str(data.get("misconception_type", "")).strip()
-            or "Unclassified Misconception",
-            confidence=confidence,
-            explanation=str(data.get("explanation", "")).strip(),
-            intervention=str(data.get("intervention", "")).strip(),
-            is_correct=parse_bool(data.get("is_correct", False)),
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini response missing required fields: {exc}",
-        ) from exc
-
-
-@app.get("/")
-def health() -> dict[str, str]:
-    return {"status": "ok", "service": "relearn-backend"}
-
-
-@app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(request: AnalyzeRequest) -> AnalyzeResponse:
-    return analyze_with_gemini(request)
-
-
-@app.post("/save-session")
-def save_session(request: SaveSessionRequest) -> dict[str, Any]:
-    client = get_supabase()
-    row = request.model_dump()
-    try:
-        response = client.table(SESSIONS_TABLE).insert(row).execute()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to save session: {exc}") from exc
-
-    data = response.data or []
-    return {"saved": True, "session": data[0] if data else row}
-
-
-@app.get("/sessions")
-def list_sessions() -> dict[str, Any]:
-    client = get_supabase()
-    try:
-        response = (
-            client.table(SESSIONS_TABLE)
-            .select("*")
-            .order("created_at", desc=True)
-            .execute()
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to load sessions: {exc}") from exc
-
-    sessions = response.data or []
-    return {"sessions": sessions, "count": len(sessions)}
-
-
-@app.patch("/sessions/{session_id}/resolve")
-def resolve_session(session_id: str) -> dict[str, Any]:
-    client = get_supabase()
-    try:
-        response = (
-            client.table(SESSIONS_TABLE)
-            .update({"resolved": True})
-            .eq("id", session_id)
-            .execute()
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to resolve session: {exc}") from exc
-
-    data = response.data or []
-    if not data:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    return {"resolved": True, "session": data[0]}
+# ------------------------------------------------------------
+# Demo scenario endpoint – handy for judges & mentors
+# ------------------------------------------------------------
+@app.get("/demo/scenario", tags=["Demo"])
+def demo_scenario():
+    """
+    Returns a JSON object describing the exact flow the judges can
+    follow step‑by‑step. The front‑end can also use this to pre‑fill
+    a demo user.
+    """
+    return {
+        "login": {"email": "demo@relearn.dev", "password": "demo1234"},
+        "questionId": "q_eq_meaning",
+        "studentAnswer": "It assigns a value to a variable.",
+        "reasoning": "== puts the value into the variable.",
+        "expectedMisconception": "assignment_vs_comparison",
+        "reassessmentQuestionId": "q_eq_result",
+        "reassessmentAnswer": "true",
+        "flow": [
+            "POST /auth/login",
+            "POST /attempts with q_eq_meaning",
+            "GET /diagnosis → receives misconception & intervention",
+            "POST /reassessments with the new question & answer",
+            "GET /students/demo_student/progress",
+        ],
+        "keyMessage": "We do not just mark wrong – we diagnose WHY and verify the fix.",
+    }
