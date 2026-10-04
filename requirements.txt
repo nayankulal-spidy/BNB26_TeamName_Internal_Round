@@ -1,6 +1,7 @@
 fastapi
 uvicorn
-google-generativeai
 supabase
 python-dotenv
 httpx
+sqlalchemy
+PyJWT
